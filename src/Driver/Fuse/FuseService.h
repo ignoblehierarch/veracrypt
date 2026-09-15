@@ -55,7 +55,25 @@ namespace VeraCrypt
 		static shared_ptr <Buffer> GetVolumeInfo ();
 		static uint64 GetVolumeSize ();
 		static uint64 GetVolumeSectorSize () { return MountedVolume->GetSectorSize(); }
-		static void Mount (shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, const string &fuseMountPoint);
+
+		// daemonRequest, when not null, is a serialized MountOptions object. Where
+		// it is supported (macFUSE builds on macOS), passing it makes Mount()
+		// exec() a dedicated FUSE daemon process and hand it the request on its
+		// standard input, instead of running the FUSE session in a fork() child of
+		// the caller. See the comment in Mount() for why that matters.
+		static void Mount (shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, const string &fuseMountPoint, const Buffer *daemonRequest = nullptr);
+
+		// Entry point of the FUSE session. detach selects whether this process has
+		// to turn itself into the daemon (exec()ed daemon) or whether it already is
+		// the child it is meant to run in (fork()ed ExecFunctor).
+		static void RunDaemon (int argc, char *argv[], shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, bool detach);
+
+		// Called by the FUSE init handler once the mount point is live.
+		static void NotifyDaemonReady ();
+
+		// argv[1] of the exec()ed FUSE daemon. Not a documented option: it is an
+		// implementation detail of Mount() and takes its request on stdin.
+		static const char *GetDaemonCommandLineOption () { return "--fuse-daemon"; }
 		static void ReadVolumeSectors (const BufferPtr &buffer, uint64 byteOffset);
 		static void ReceiveAuxDeviceInfo (const ConstBufferPtr &buffer);
 		static void SendAuxDeviceInfo (const DirectoryPath &fuseMountPoint, const DevicePath &virtualDevice, const DevicePath &loopDevice = DevicePath());
@@ -73,6 +91,7 @@ namespace VeraCrypt
 		static uid_t UserId;
 		static gid_t GroupId;
 		static unique_ptr <Pipe> SignalHandlerPipe;
+		static unique_ptr <Pipe> DaemonReadyPipe;
 	};
 }
 

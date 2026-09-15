@@ -28,28 +28,125 @@
 
 #if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
 #include "Core/Unix/MacOSXDiskArbitration.h"
+#include "Core/MountOptions.h"
+#include "Driver/Fuse/FuseService.h"
+#include "Platform/MemoryStream.h"
+#include "Volume/Cipher.h"
+#include "Volume/Volume.h"
 #endif
 
 using namespace VeraCrypt;
+
+#if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
+namespace
+{
+	// Entry point of the FUSE daemon that FuseService::Mount() exec()s.
+	//
+	// Nothing in this process has initialized wxWidgets, Cocoa, the encryption
+	// thread pool or the core service, and nothing here is going to: that is the
+	// entire point. macFUSE 5 performs the mount in-process, so the mount has to
+	// happen somewhere the Objective-C and libdispatch runtimes are pristine,
+	// which a fork child of the GUI process is not and cannot be made to be.
+	int FuseDaemonMain (int argc, char **argv)
+	{
+		try
+		{
+			// The request is a serialized MountOptions, written to our stdin by
+			// Process::Execute() in the caller. It carries the password, which is
+			// why it comes through a pipe rather than argv or the environment.
+			SecureBuffer request;
+			{
+				vector <uint8> data;
+				uint8 buf[4096];
+				ssize_t bytesRead;
+
+				while ((bytesRead = read (STDIN_FILENO, buf, sizeof (buf))) > 0)
+					data.insert (data.end(), buf, buf + bytesRead);
+
+				throw_sys_if (bytesRead == -1);
+
+				if (data.empty())
+					throw ParameterIncorrect (SRC_POS);
+
+				request.CopyFrom (ConstBufferPtr (&data[0], data.size()));
+				Memory::Zero (&data[0], data.size());
+			}
+
+			shared_ptr <Stream> stream (new MemoryStream (request));
+			shared_ptr <MountOptions> options = Serializable::DeserializeNew <MountOptions> (stream);
+			request.Erase();
+
+			VeraCrypt::Cipher::EnableHwSupport (!options->NoHardwareCrypto);
+
+			make_shared_auto (Volume, volume);
+			volume->Open (
+				*options->Path,
+				options->PreserveTimestamps,
+				options->Password,
+				options->Pim,
+				options->Kdf,
+				options->Keyfiles,
+				options->EMVSupportEnabled,
+				options->Protection,
+				options->ProtectionPassword,
+				options->ProtectionPim,
+				options->ProtectionKdf,
+				options->ProtectionKeyfiles,
+				options->SharedAccessAllowed,
+				VolumeType::Unknown,
+				options->UseBackupHeaders,
+				options->PartitionInSystemEncryptionScope
+				);
+
+			options->Password.reset();
+			options->ProtectionPassword.reset();
+
+			// argv[0] is this binary and argv[1] is the daemon option; libfuse gets
+			// the rest, which starts with the device type it expects as its argv[0].
+			// RunDaemon() does not return.
+			FuseService::RunDaemon (argc - 2, argv + 2, volume, options->SlotNumber, true);
+			return 0;
+		}
+		catch (exception &e)
+		{
+			// Still attached to the stderr Process::Execute() is reading, so this
+			// reaches the caller as the text of an ExecutedProcessFailed.
+			cerr << StringConverter::GetTypeName (typeid (e)) << endl << e.what() << endl;
+		}
+		catch (...)
+		{
+			cerr << "Unknown exception in FUSE daemon" << endl;
+		}
+
+		return 1;
+	}
+}
+#endif
 
 int main (int argc, char **argv)
 {
 	try
 	{
 #if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
-		// Do this before anything forks. VeraCrypt links Cocoa and is
-		// multithreaded, and both CoreService::Start() and FuseService::Mount()
-		// fork() without exec(), so their children run under the Objective-C
-		// runtime's fork-safety rule: a class whose +initialize did not already
-		// run in the parent cannot be initialized in the child, and touching one
-		// aborts the process (objc_initializeAfterForkError, SIGABRT).
-		//
-		// macFUSE 5 performs the mount in-process and creates a DiskArbitration
-		// session on a helper thread inside the FUSE child, which trips exactly
-		// that and kills the mount. (macFUSE 4 did not: it exec()ed the setuid
-		// mount_macfuse helper, and exec() reinitializes the runtime.)
-		// Initializing DiskArbitration here gets that work done in the true
-		// parent; every descendant inherits it and never has to run +initialize.
+		// First, ahead of everything below: this process may have been exec()ed by
+		// FuseService::Mount() to be a FUSE daemon and nothing else. It must reach
+		// libfuse without having initialized Cocoa, DiskArbitration, libdispatch or
+		// the core service, because it is going to fork one last time and the child
+		// is the process that mounts, serves and unmounts the filesystem.
+		if (argc > 2 && strcmp (argv[1], FuseService::GetDaemonCommandLineOption()) == 0)
+			return FuseDaemonMain (argc, argv);
+
+		// Fallback path only. Where Mount() cannot exec() a daemon it forks one,
+		// and that child runs under the Objective-C runtime's fork-safety rule: a
+		// class whose +initialize did not already run in the parent cannot be
+		// initialized in the child, and touching one aborts the process
+		// (objc_initializeAfterForkError, SIGABRT). macFUSE 5 trips exactly that,
+		// because it mounts in-process and creates a DiskArbitration session while
+		// doing so. Initializing DiskArbitration here, before anything forks, gets
+		// that work done in the true parent; descendants inherit it and never have
+		// to run +initialize. Note that this cannot help with teardown, where
+		// libdispatch -- which has no such escape hatch -- is the one being used in
+		// a fork child. Only the exec()ed daemon fixes that.
 		PrewarmDiskArbitration();
 #endif
 

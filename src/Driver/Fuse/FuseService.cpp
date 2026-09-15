@@ -35,15 +35,23 @@
 #include <fcntl.h>
 #include <fuse.h>
 #include <iostream>
+#include <limits.h>
 #include <signal.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+
+#if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
+// Declared rather than included: <mach-o/dyld.h> pulls in <mach/error.h>, whose
+// ERR_SUCCESS macro collides with the ERR_SUCCESS enumerator in Common/Tcdefs.h.
+extern "C" int _NSGetExecutablePath (char *buf, uint32_t *bufsize);
+#endif
 
 #include "FuseService.h"
 #include "Platform/FileStream.h"
@@ -70,6 +78,26 @@ namespace VeraCrypt
 	{
 		return (value / divisor) + ((value % divisor) ? 1 : 0);
 	}
+
+#if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
+	// Path of the running binary, for the exec() in FuseService::Mount(). argv[0]
+	// is not good enough (it need not be a path at all) and the caller may be a
+	// fork child of a process that has since moved on, so ask the loader.
+	static string fuse_service_get_executable_path ()
+	{
+		uint32_t size = 0;
+		_NSGetExecutablePath (nullptr, &size);
+
+		vector <char> path (size + 1, 0);
+		throw_sys_if (_NSGetExecutablePath (&path[0], &size) != 0);
+
+		char resolved[PATH_MAX];
+		if (realpath (&path[0], resolved))
+			return string (resolved);
+
+		return string (&path[0]);
+	}
+#endif
 
 	static void fuse_service_set_stat_blocks (struct stat *statData)
 	{
@@ -138,6 +166,10 @@ namespace VeraCrypt
 		{
 			SystemLog::WriteException (UnknownException (SRC_POS));
 		}
+
+		// The mount point is live at this point, which is what the process that
+		// spawned an exec()ed daemon is waiting to hear. No-op otherwise.
+		FuseService::NotifyDaemonReady();
 
 		return nullptr;
 	}
@@ -650,7 +682,7 @@ namespace VeraCrypt
 		return MountedVolume->GetSize();
 	}
 
-	void FuseService::Mount (shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, const string &fuseMountPoint)
+	void FuseService::Mount (shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, const string &fuseMountPoint, const Buffer *daemonRequest)
 	{
 		list <string> args;
 		args.push_back (FuseService::GetDeviceType());
@@ -689,14 +721,38 @@ namespace VeraCrypt
 		ExecFunctor execFunctor (openVolume, slotNumber);
 
 #if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
-		// Process::Execute() forks and runs execFunctor directly; the child never
-		// calls exec(). Under macFUSE 5, fuse_darwin_mount() creates a
-		// DiskArbitration session on a helper thread in that child, and the
-		// Objective-C runtime aborts a fork child that has to run +initialize for
-		// a class its parent had not initialized. main() calls
-		// PrewarmDiskArbitration() before any fork so that it never has to.
+		if (daemonRequest)
+		{
+			// Run the FUSE session in a process of its own.
+			//
+			// The alternative below hands execFunctor to Process::Execute(), which
+			// runs it in a fork() child that never calls exec(). Under macFUSE 5
+			// that child is where the mount actually happens: fuse_darwin_mount()
+			// creates a DiskArbitration session, and libdispatch and the
+			// Objective-C runtime are both entitled to refuse to work in a fork
+			// child of a multithreaded process. They do: +initialize for a class
+			// the parent had not initialized aborts the process, and the dispatch
+			// channel MFMount.framework opens at mount time is torn down in
+			// fuse_destroy() against root queues the child only inherited a dead
+			// copy of, which segfaults. macFUSE 4 did not have the problem because
+			// it exec()ed the setuid mount_macfuse helper and exec() reinitializes
+			// both runtimes.
+			//
+			// So exec(). The daemon receives the serialized MountOptions on stdin,
+			// opens the volume itself, and only then touches libfuse; -f keeps
+			// libfuse from daemonizing, because that fork would reintroduce exactly
+			// the split we are removing. RunDaemon() detaches before the first
+			// libfuse call instead.
+			args.push_front (GetDaemonCommandLineOption());
+			args.push_back ("-f");
+
+			Process::Execute (fuse_service_get_executable_path(), args, -1, nullptr, daemonRequest);
+		}
+		else
 #endif
-		Process::Execute ("fuse", args, -1, &execFunctor);
+		{
+			Process::Execute ("fuse", args, -1, &execFunctor);
+		}
 
 		for (int t = 0; true; t++)
 		{
@@ -775,12 +831,44 @@ namespace VeraCrypt
 
 	void FuseService::ExecFunctor::operator() (int argc, char *argv[])
 	{
+		// Already running in the fork() child Process::Execute() made for us.
+		FuseService::RunDaemon (argc, argv, MountedVolume, SlotNumber, false);
+	}
+
+	void FuseService::NotifyDaemonReady ()
+	{
+		if (!DaemonReadyPipe)
+			return;
+
+		// The mount point is live, so from here on nothing we print can reach the
+		// process that spawned us: it is about to stop reading. Detach the standard
+		// descriptors first, then release it. Doing it in this order leaves no
+		// window in which a write could land on a pipe with no reader.
+		int nullDev = open ("/dev/null", O_RDWR);
+		if (nullDev != -1)
+		{
+			dup2 (nullDev, STDOUT_FILENO);
+			dup2 (nullDev, STDERR_FILENO);
+
+			if (nullDev > STDERR_FILENO)
+				close (nullDev);
+		}
+
+		uint8 buf[1] = { 1 };
+		if (write (DaemonReadyPipe->PeekWriteFD(), buf, sizeof (buf))) { } // Errors ignored
+
+		DaemonReadyPipe->Close();
+		DaemonReadyPipe.reset();
+	}
+
+	void FuseService::RunDaemon (int argc, char *argv[], shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, bool detach)
+	{
 		struct timeval tv;
 		gettimeofday (&tv, NULL);
 		FuseService::OpenVolumeInfo.SerialInstanceNumber = (uint64)tv.tv_sec * 1000000ULL + tv.tv_usec;
 
-		FuseService::MountedVolume = MountedVolume;
-		FuseService::SlotNumber = SlotNumber;
+		FuseService::MountedVolume = openVolume;
+		FuseService::SlotNumber = slotNumber;
 
 		FuseService::UserId = getuid();
 		FuseService::GroupId = getgid();
@@ -808,6 +896,46 @@ namespace VeraCrypt
 			{
 				FuseService::UserId = doasUid;
 				FuseService::GroupId = doasGid;
+			}
+		}
+
+		if (detach)
+		{
+			// Become the daemon now, before the first libfuse call, so that the
+			// process which mounts the filesystem is also the one that serves it
+			// and later tears it down. libfuse would otherwise do this for us in
+			// fuse_daemonize() -- but it does it *after* fuse_mount(), which leaves
+			// the DiskArbitration session and the MFMount dispatch channel owned by
+			// a process that no longer exists and their state inherited by one that
+			// cannot use it. Hence -f in Mount() and this fork here.
+			//
+			// This is a fork of a process that was exec()ed moments ago, is single
+			// threaded, and has touched neither Cocoa nor libdispatch, so the child
+			// is a fork child in name only: both runtimes start clean in it.
+			DaemonReadyPipe.reset (new Pipe);
+
+			int daemonPid = fork();
+			throw_sys_if (daemonPid == -1);
+
+			if (daemonPid != 0)
+			{
+				// Report the outcome of the mount to Process::Execute() in the
+				// caller: a byte from fuse_service_init() means the mount point is
+				// live, EOF means the daemon died before that, and anything it
+				// printed on the way out is still on the inherited stderr.
+				uint8 buf[1];
+				ssize_t bytesRead = read (DaemonReadyPipe->GetReadFD(), buf, sizeof (buf));
+				_exit (bytesRead == 1 ? 0 : 1);
+			}
+
+			DaemonReadyPipe->GetWriteFD();
+
+			if (chdir ("/") == -1) { } // Errors ignored
+			int nullDev = open ("/dev/null", O_RDONLY);
+			if (nullDev != -1)
+			{
+				dup2 (nullDev, STDIN_FILENO);
+				close (nullDev);
 			}
 		}
 
@@ -871,4 +999,5 @@ namespace VeraCrypt
 	uid_t FuseService::UserId;
 	gid_t FuseService::GroupId;
 	unique_ptr <Pipe> FuseService::SignalHandlerPipe;
+	unique_ptr <Pipe> FuseService::DaemonReadyPipe;
 }

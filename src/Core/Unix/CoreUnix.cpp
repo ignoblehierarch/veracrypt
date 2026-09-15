@@ -1078,6 +1078,7 @@ namespace VeraCrypt
 		Cipher::EnableHwSupport (!options.NoHardwareCrypto);
 
 		shared_ptr <Volume> volume;
+		unique_ptr <SecureBuffer> daemonRequest;
 
 		while (true)
 		{
@@ -1101,6 +1102,28 @@ namespace VeraCrypt
 					options.UseBackupHeaders,
 					options.PartitionInSystemEncryptionScope
 					);
+
+#if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
+				// The FUSE daemon is a separate process now (see FuseService::Mount)
+				// and has to open the volume for itself, so capture what it needs
+				// while the password is still here. Pinning the KDF to the one that
+				// just worked keeps it to a single key derivation instead of a
+				// search over every supported PRF.
+				{
+					MountOptions daemonOptions (options);
+					daemonOptions.Kdf = volume->GetPkcs5Kdf();
+
+					shared_ptr <Stream> stream (new MemoryStream);
+					daemonOptions.Serialize (stream);
+
+					ConstBufferPtr serialized (*static_cast <MemoryStream *> (stream.get()));
+					daemonRequest.reset (new SecureBuffer (serialized));
+
+					// MemoryStream keeps its bytes in an ordinary vector, and those
+					// bytes contain the password.
+					BufferPtr (const_cast <uint8 *> (serialized.Get()), serialized.Size()).Erase();
+				}
+#endif
 
 				options.Password.reset();
 			}
@@ -1171,10 +1194,13 @@ namespace VeraCrypt
 
 		try
 		{
-			FuseService::Mount (volume, options.SlotNumber, fuseMountPoint);
+			FuseService::Mount (volume, options.SlotNumber, fuseMountPoint, daemonRequest.get());
+			daemonRequest.reset();
 		}
 		catch (...)
 		{
+			daemonRequest.reset();
+
 			try
 			{
 				DirectoryPath (fuseMountPoint).Delete();
