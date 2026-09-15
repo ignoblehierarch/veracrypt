@@ -97,6 +97,85 @@ namespace VeraCrypt
 
 		return string (&path[0]);
 	}
+
+	// Start the FUSE daemon: fork, fork again, exec in the grandchild.
+	//
+	// The process that ends up calling fuse_main() must be one that has exec()ed,
+	// not a fork child. fuse_darwin_mount() creates a DiskArbitration session, and
+	// the Objective-C runtime aborts any process that runs +initialize for a class
+	// its parent had not initialized when that process is the child side of a
+	// fork() with no exec() in between -- which is most of macFUSE 5's mount path.
+	// So the daemon exec()s once and then forks for nothing until the mount is up.
+	//
+	// The second fork is what lets the daemon outlive this call without being
+	// waited for: the intermediate exits immediately, the daemon is orphaned onto
+	// launchd, and a caller that mounts more than one volume (the core service
+	// does) never accumulates a zombie for a process that only exits at dismount.
+	// Everything between the two forks is restricted to fork-safe calls, which is
+	// why argv is built before the first fork and nothing in there allocates.
+	//
+	// Descriptors: the serialized MountOptions arrive on stdin, the mount-is-live
+	// notification leaves on stdout, and stderr stays as inherited because that is
+	// where a daemon that fails to mount says so.
+	static void fuse_service_spawn_daemon (const string &exePath, const list <string> &arguments, const Buffer &request, Pipe &readyPipe)
+	{
+		vector <char *> args (arguments.size() + 2, nullptr);
+
+		size_t argIndex = 0;
+		args[argIndex++] = const_cast <char *> (exePath.c_str());
+		for (list <string>::const_iterator it = arguments.begin(); it != arguments.end(); ++it)
+			args[argIndex++] = const_cast <char *> (it->c_str());
+		args[argIndex] = nullptr;
+
+		Pipe requestPipe;
+
+		int intermediatePid = fork();
+		throw_sys_if (intermediatePid == -1);
+
+		if (intermediatePid == 0)
+		{
+			if (fork() == 0)
+			{
+				int requestRead = requestPipe.PeekReadFD();
+				int requestWrite = requestPipe.PeekWriteFD();
+				int readyRead = readyPipe.PeekReadFD();
+				int readyWrite = readyPipe.PeekWriteFD();
+
+				if (dup2 (requestRead, STDIN_FILENO) != -1 && dup2 (readyWrite, STDOUT_FILENO) != -1)
+				{
+					if (requestRead > STDERR_FILENO)
+						close (requestRead);
+					if (requestWrite > STDERR_FILENO)
+						close (requestWrite);
+					if (readyRead > STDERR_FILENO)
+						close (readyRead);
+					if (readyWrite > STDERR_FILENO)
+						close (readyWrite);
+
+					execv (args[0], &args[0]);
+				}
+
+				_exit (127);
+			}
+
+			_exit (0);
+		}
+
+		// The intermediate only forks and exits, so this returns at once.
+		int status;
+		while (waitpid (intermediatePid, &status, 0) == -1 && errno == EINTR)
+			;
+
+		requestPipe.GetWriteFD();
+		throw_sys_if (write (requestPipe.PeekWriteFD(), request.Ptr(), request.Size()) == -1 && errno != EPIPE);
+		requestPipe.Close();
+
+		// Drop our copy of the write end: with only the daemon holding it, a read
+		// returning EOF means the daemon died, which is how the caller tells a
+		// failed mount from a slow one.
+		readyPipe.GetReadFD();
+		throw_sys_if (fcntl (readyPipe.PeekReadFD(), F_SETFL, O_NONBLOCK) == -1);
+	}
 #endif
 
 	static void fuse_service_set_stat_blocks (struct stat *statData)
@@ -721,6 +800,8 @@ namespace VeraCrypt
 		ExecFunctor execFunctor (openVolume, slotNumber);
 
 #if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
+		unique_ptr <Pipe> daemonReadyPipe;
+
 		if (daemonRequest)
 		{
 			// Run the FUSE session in a process of its own.
@@ -739,14 +820,16 @@ namespace VeraCrypt
 			// both runtimes.
 			//
 			// So exec(). The daemon receives the serialized MountOptions on stdin,
-			// opens the volume itself, and only then touches libfuse; -f keeps
+			// opens the volume itself, and only then touches libfuse. -f keeps
 			// libfuse from daemonizing, because that fork would reintroduce exactly
-			// the split we are removing. RunDaemon() detaches before the first
-			// libfuse call instead.
+			// the split we are removing; fuse_service_spawn_daemon() has already
+			// detached the daemon on this side of the exec(), so libfuse has no
+			// reason to.
 			args.push_front (GetDaemonCommandLineOption());
 			args.push_back ("-f");
 
-			Process::Execute (fuse_service_get_executable_path(), args, -1, nullptr, daemonRequest);
+			daemonReadyPipe.reset (new Pipe);
+			fuse_service_spawn_daemon (fuse_service_get_executable_path(), args, *daemonRequest, *daemonReadyPipe);
 		}
 		else
 #endif
@@ -756,6 +839,23 @@ namespace VeraCrypt
 
 		for (int t = 0; true; t++)
 		{
+#if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
+			if (daemonReadyPipe)
+			{
+				// The daemon closes this descriptor when it dies, so EOF here means
+				// the mount failed and there is no point waiting out the timeout
+				// below. Whatever it printed on the way down is on our stderr.
+				uint8 buf[1];
+				ssize_t bytesRead = read (daemonReadyPipe->PeekReadFD(), buf, sizeof (buf));
+
+				if (bytesRead == 0)
+					throw ExecutedProcessFailed (SRC_POS, fuse_service_get_executable_path(), 1, "FUSE daemon exited before the mount point became available");
+
+				if (bytesRead == 1)
+					daemonReadyPipe.reset();	// Mounted; the control file check below confirms it
+			}
+#endif
+
 			try
 			{
 				if (FilesystemPath (fuseMountPoint + FuseService::GetControlPath()).GetType() == FilesystemPathType::File)
@@ -837,8 +937,13 @@ namespace VeraCrypt
 
 	void FuseService::NotifyDaemonReady ()
 	{
-		if (!DaemonReadyPipe)
+		if (DaemonReadyFD == -1)
 			return;
+
+		// The notification channel *is* stdout, so take a copy of it before the
+		// redirect below takes stdout away.
+		int readyFD = dup (DaemonReadyFD);
+		DaemonReadyFD = -1;
 
 		// The mount point is live, so from here on nothing we print can reach the
 		// process that spawned us: it is about to stop reading. Detach the standard
@@ -854,11 +959,12 @@ namespace VeraCrypt
 				close (nullDev);
 		}
 
-		uint8 buf[1] = { 1 };
-		if (write (DaemonReadyPipe->PeekWriteFD(), buf, sizeof (buf))) { } // Errors ignored
-
-		DaemonReadyPipe->Close();
-		DaemonReadyPipe.reset();
+		if (readyFD != -1)
+		{
+			uint8 buf[1] = { 1 };
+			if (write (readyFD, buf, sizeof (buf))) { } // Errors ignored
+			close (readyFD);
+		}
 	}
 
 	void FuseService::RunDaemon (int argc, char *argv[], shared_ptr <Volume> openVolume, VolumeSlotNumber slotNumber, bool detach)
@@ -901,41 +1007,31 @@ namespace VeraCrypt
 
 		if (detach)
 		{
-			// Become the daemon now, before the first libfuse call, so that the
-			// process which mounts the filesystem is also the one that serves it
-			// and later tears it down. libfuse would otherwise do this for us in
-			// fuse_daemonize() -- but it does it *after* fuse_mount(), which leaves
-			// the DiskArbitration session and the MFMount dispatch channel owned by
-			// a process that no longer exists and their state inherited by one that
-			// cannot use it. Hence -f in Mount() and this fork here.
+			// We are the exec()ed daemon, and from here to the mount nothing may
+			// fork. The process that calls fuse_main() has to be this one, the one
+			// that exec()ed: fuse_darwin_mount() creates a DiskArbitration session
+			// on a thread of its own, and initializing DA's classes in a process
+			// that is the child side of a fork() with no exec() in between is what
+			// objc aborts on. libfuse would fork in fuse_daemonize() after
+			// fuse_mount() -- hence -f in Mount() -- and detaching was already done
+			// on the other side of the exec() by fuse_service_spawn_daemon(), which
+			// is why there is nothing left to do here but take our descriptors out
+			// of the caller's way.
 			//
-			// This is a fork of a process that was exec()ed moments ago, is single
-			// threaded, and has touched neither Cocoa nor libdispatch, so the child
-			// is a fork child in name only: both runtimes start clean in it.
-			DaemonReadyPipe.reset (new Pipe);
-
-			int daemonPid = fork();
-			throw_sys_if (daemonPid == -1);
-
-			if (daemonPid != 0)
-			{
-				// Report the outcome of the mount to Process::Execute() in the
-				// caller: a byte from fuse_service_init() means the mount point is
-				// live, EOF means the daemon died before that, and anything it
-				// printed on the way out is still on the inherited stderr.
-				uint8 buf[1];
-				ssize_t bytesRead = read (DaemonReadyPipe->GetReadFD(), buf, sizeof (buf));
-				_exit (bytesRead == 1 ? 0 : 1);
-			}
-
-			DaemonReadyPipe->GetWriteFD();
+			// setsid() below still works: the daemon is the child of an intermediate
+			// that has exited, so it is not a process group leader.
+			DaemonReadyFD = STDOUT_FILENO;
 
 			if (chdir ("/") == -1) { } // Errors ignored
+
+			// The request has already been read from stdin, in FuseDaemonMain().
 			int nullDev = open ("/dev/null", O_RDONLY);
 			if (nullDev != -1)
 			{
 				dup2 (nullDev, STDIN_FILENO);
-				close (nullDev);
+
+				if (nullDev > STDERR_FILENO)
+					close (nullDev);
 			}
 		}
 
@@ -999,5 +1095,5 @@ namespace VeraCrypt
 	uid_t FuseService::UserId;
 	gid_t FuseService::GroupId;
 	unique_ptr <Pipe> FuseService::SignalHandlerPipe;
-	unique_ptr <Pipe> FuseService::DaemonReadyPipe;
+	int FuseService::DaemonReadyFD = -1;
 }

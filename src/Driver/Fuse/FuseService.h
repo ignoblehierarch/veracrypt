@@ -91,7 +91,11 @@ namespace VeraCrypt
 		static uid_t UserId;
 		static gid_t GroupId;
 		static unique_ptr <Pipe> SignalHandlerPipe;
-		static unique_ptr <Pipe> DaemonReadyPipe;
+
+		// The exec()ed daemon's end of the pipe its spawner waits on; stdout, set
+		// by RunDaemon() and consumed by NotifyDaemonReady(). -1 when this process
+		// is not an exec()ed FUSE daemon, which makes NotifyDaemonReady() a no-op.
+		static int DaemonReadyFD;
 	};
 }
 
