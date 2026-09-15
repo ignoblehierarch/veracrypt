@@ -344,6 +344,11 @@ $(error Specified SDK version was not found, ensure your active developer direct
 
 	ifneq "$(VC_OSX_FUSET)" "0"
 		C_CXX_FLAGS += -DVC_MACOSX_FUSET
+	else
+		# macFUSE builds only: FuseService::Mount() initializes DiskArbitration in
+		# the parent so that the fork()ed FUSE child does not have to. FUSE-T does
+		# not use DiskArbitration, so it does not need the framework.
+		LFLAGS += -framework DiskArbitration
 	endif
 
 	export CFLAGS_ARM64 := $(CFLAGS) $(C_CXX_FLAGS) -arch arm64 -march=armv8-a+crypto

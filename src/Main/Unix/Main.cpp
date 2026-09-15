@@ -26,12 +26,33 @@
 #include <ApplicationServices/ApplicationServices.h>
 #endif
 
+#if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
+#include "Core/Unix/MacOSXDiskArbitration.h"
+#endif
+
 using namespace VeraCrypt;
 
 int main (int argc, char **argv)
 {
 	try
 	{
+#if defined (TC_MACOSX) && !defined (VC_MACOSX_FUSET)
+		// Do this before anything forks. VeraCrypt links Cocoa and is
+		// multithreaded, and both CoreService::Start() and FuseService::Mount()
+		// fork() without exec(), so their children run under the Objective-C
+		// runtime's fork-safety rule: a class whose +initialize did not already
+		// run in the parent cannot be initialized in the child, and touching one
+		// aborts the process (objc_initializeAfterForkError, SIGABRT).
+		//
+		// macFUSE 5 performs the mount in-process and creates a DiskArbitration
+		// session on a helper thread inside the FUSE child, which trips exactly
+		// that and kills the mount. (macFUSE 4 did not: it exec()ed the setuid
+		// mount_macfuse helper, and exec() reinitializes the runtime.)
+		// Initializing DiskArbitration here gets that work done in the true
+		// parent; every descendant inherits it and never has to run +initialize.
+		PrewarmDiskArbitration();
+#endif
+
 		// Make sure all required commands can be executed via default search path
 		string sysPathStr = "/usr/sbin:/sbin:/usr/bin:/bin";
 

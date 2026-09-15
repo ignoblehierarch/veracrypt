@@ -687,6 +687,15 @@ namespace VeraCrypt
 #endif
 
 		ExecFunctor execFunctor (openVolume, slotNumber);
+
+#if defined(TC_MACOSX) && !defined(VC_MACOSX_FUSET)
+		// Process::Execute() forks and runs execFunctor directly; the child never
+		// calls exec(). Under macFUSE 5, fuse_darwin_mount() creates a
+		// DiskArbitration session on a helper thread in that child, and the
+		// Objective-C runtime aborts a fork child that has to run +initialize for
+		// a class its parent had not initialized. main() calls
+		// PrewarmDiskArbitration() before any fork so that it never has to.
+#endif
 		Process::Execute ("fuse", args, -1, &execFunctor);
 
 		for (int t = 0; true; t++)

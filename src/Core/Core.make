@@ -26,6 +26,13 @@ OBJS += Unix/$(PLATFORM)/Core$(PLATFORM).o
 OBJS += Unix/$(PLATFORM)/Core$(PLATFORM).o
 ifeq "$(PLATFORM)" "MacOSX"
 OBJS += Unix/FreeBSD/CoreFreeBSD.o
+# macFUSE 5 mounts in-process and creates a DiskArbitration session on a helper
+# thread inside the fork()ed FUSE child, which the Objective-C runtime will not
+# allow. main() pre-initializes it before anything forks. FUSE-T does not use
+# DiskArbitration and does not need this.
+ifeq "$(VC_OSX_FUSET)" "0"
+OBJS += Unix/MacOSXDiskArbitration.o
+endif
 endif
 
 include $(BUILD_INC)/Makefile.inc
